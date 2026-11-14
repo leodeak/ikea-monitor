@@ -1,0 +1,55 @@
+name: IKEA monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = controllo normale, test = messaggio di prova, debug = salva schermata e dati"
+        default: "run"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ikea-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installa dipendenze
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Esegui controllo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py "${{ github.event.inputs.mode || 'run' }}"
+
+      - name: Salva lo stato
+        if: success() && github.event.inputs.mode != 'debug' && github.event.inputs.mode != 'test'
+        run: |
+          git config user.name "ikea-monitor"
+          git config user.email "ikea-monitor@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "aggiorna stato" && git push)
+
+      - name: Carica i file di debug
+        if: always() && github.event.inputs.mode == 'debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
