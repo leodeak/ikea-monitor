@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
-"""Monitor dell'Angolo della circolarità IKEA (Corsico, San Giuliano, Carugate).
+"""Monitor dell'Angolo della circolarità IKEA -> avvisi Telegram.
 
 Uso:
     python monitor.py          # controllo normale, avvisa su Telegram
     python monitor.py test     # invia solo un messaggio Telegram di prova
-    python monitor.py debug    # non avvisa; salva screenshot e dati in ./debug
+    python monitor.py debug    # non avvisa; salva i dati letti in ./debug
 
 Variabili d'ambiente: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Negozi da controllare (codici IKEA). Togli una riga per escludere un negozio.
+STORES = {
+    "455": "Corsico",
+    "295": "San Giuliano",
+    "233": "Carugate",
+}
+
 PAGE_URL = (
     "https://www.ikea.com/it/it/second-hand/buy-from-ikea/"
     "#/milano+carugate-milano+corsico-milano+san+giuliano?sort=id-desc"
 )
+API_URL = "https://web-api.ikea.com/circular/circular-asis/offers/grouped/search"
+API_PAGES = 3        # 3 pagine x 32 = i 96 gruppi più recenti
+API_PAGE_SIZE = 32
+
+TARGET_ARTICLE = "30450609"
 TARGET_LABEL = "VESTERÖY materasso a molle insacchettate, rigido/azzurro, 140x200 cm"
 TARGET_PRODUCT_URL = (
     "https://www.ikea.com/it/it/p/"
@@ -36,16 +49,6 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Chiavi probabili nei dati JSON della pagina (si prova la prima che esiste).
-ID_KEYS = ["id", "uid", "productId", "itemId", "articleId", "articleNumber",
-           "articleNo", "itemNo", "itemNumber", "sku", "code"]
-NAME_KEYS = ["name", "title", "productName", "productTitle", "itemName", "typeName"]
-PRICE_KEYS = ["price", "salesPrice", "sellingPrice", "currentPrice",
-              "priceNumeral", "prices", "amount"]
-STORE_KEYS = ["store", "storeName", "shopName", "shop", "location", "storeId"]
-IMG_KEYS = ["image", "imageUrl", "img", "images", "mainImage", "picture", "photo"]
-URL_KEYS = ["url", "pipUrl", "link", "href"]
-
 
 # ----------------------------------------------------------------- utilità
 
@@ -56,193 +59,160 @@ def norm(text):
     return re.sub(r"\s+", " ", text)
 
 
-def first(d, keys):
-    for k in keys:
-        if k in d and d[k] not in (None, "", [], {}):
-            return d[k]
-    return None
-
-
-def to_text(v):
+def money(v):
     if v is None:
         return ""
-    if isinstance(v, dict):
-        for k in ("name", "text", "formatted", "value", "current", "label"):
-            if k in v and v[k] not in (None, "", {}):
-                return to_text(v[k])
-        return json.dumps(v, ensure_ascii=False)[:80]
-    if isinstance(v, list):
-        return to_text(v[0]) if v else ""
-    return str(v)
+    s = f"{float(v):.2f}".replace(".", ",")
+    if s.endswith(",00"):
+        s = s[:-3]
+    return "€" + s
 
 
 def is_target(item):
-    """True se l'articolo è il materasso VESTERÖY 140x200 (cod. 304.506.09)."""
-    blob = norm(json.dumps(item["raw"], ensure_ascii=False)) + " " + norm(item["name"])
-    if re.search(r"(?<!\d)304[.\s]?506[.\s]?09(?!\d)", blob):
+    """True se è il materasso VESTERÖY 140x200 (articolo 304.506.09)."""
+    if TARGET_ARTICLE in item["articles"]:
         return True
-    compact = re.sub(r"\s*x\s*", "x", blob)
-    return bool(re.search(r"vester(oe|o)y", compact)) and "140x200" in compact
+    text = norm(item["title"] + " " + item["description"])
+    text = re.sub(r"\s*x\s*", "x", text)
+    return "vester" in text and "materasso" in text and "140x200" in text
 
 
-def item_key(item):
-    return f"{item['id']}|{item['store']}"
-
-
-def absolute(url):
-    if not url:
-        return ""
-    if url.startswith("//"):
-        return "https:" + url
-    if url.startswith("/"):
-        return "https://www.ikea.com" + url
-    return url
-
-
-# ------------------------------------------------- lettura dati dalla pagina
-
-def looks_like_item(d):
-    return (
-        first(d, ID_KEYS) is not None
-        and first(d, NAME_KEYS) is not None
-        and (first(d, PRICE_KEYS) is not None or first(d, IMG_KEYS) is not None)
-    )
-
-
-def find_item_lists(obj, depth=0):
-    """Cerca nei JSON le liste di oggetti che sembrano prodotti."""
-    if depth > 8:
-        return []
-    if isinstance(obj, list):
-        dicts = [x for x in obj if isinstance(x, dict)]
-        good = [x for x in dicts if looks_like_item(x)]
-        if good and len(good) >= max(1, len(dicts) // 2):
-            return [good]
-        found = []
-        for x in obj:
-            found += find_item_lists(x, depth + 1)
-        return found
-    if isinstance(obj, dict):
-        found = []
-        for v in obj.values():
-            found += find_item_lists(v, depth + 1)
-        return found
-    return []
-
-
-def make_item(d, source):
-    return {
-        "id": str(first(d, ID_KEYS)),
-        "name": to_text(first(d, NAME_KEYS)),
-        "price": to_text(first(d, PRICE_KEYS)),
-        "store": to_text(first(d, STORE_KEYS)),
-        "url": to_text(first(d, URL_KEYS)),
-        "raw": d,
-        "source": source,
-    }
-
-
-def items_from_json(bodies):
+def flatten(groups):
+    """Trasforma i gruppi dell'API in una lista di offerte singole."""
     items = {}
-    for url, data in bodies:
-        for lst in find_item_lists(data):
-            for d in lst:
-                it = make_item(d, url)
-                items.setdefault(item_key(it), it)
-    return list(items.values())
-
-
-def items_from_dom(page):
-    """Piano B: legge i link ai prodotti direttamente dalla pagina."""
-    items = {}
-    for a in page.query_selector_all("a[href*='/p/']"):
-        href = a.get_attribute("href") or ""
-        text = (a.inner_text() or "").strip()
-        if not text:
+    for g in groups:
+        store_id = str(g.get("storeId", ""))
+        if STORES and store_id not in STORES:
             continue
-        m = re.search(r"(\d{8})/?(?:[?#].*)?$", href)
-        it = {
-            "id": m.group(1) if m else href,
-            "name": text.splitlines()[0][:120],
-            "price": "",
-            "store": "",
-            "url": href,
-            "raw": {"text": text, "href": href},
-            "source": "dom",
-        }
-        items.setdefault(item_key(it), it)
+        for o in g.get("offers") or []:
+            oid = str(o.get("id"))
+            if oid in ("None", ""):
+                continue
+            items[oid] = {
+                "id": oid,
+                "store": STORES.get(store_id, store_id),
+                "title": g.get("title") or "",
+                "description": o.get("description") or g.get("description") or "",
+                "articles": [str(a) for a in g.get("articleNumbers") or []],
+                "price": o.get("price"),
+                "original": g.get("originalPrice"),
+                "condition": o.get("productConditionTitle") or "",
+                "extra": o.get("additionalInfo") or "",
+            }
     return list(items.values())
 
 
-def fetch_items(debug=False):
-    from playwright.sync_api import sync_playwright  # import qui per poter testare il resto
+def describe(item):
+    head = item["title"]
+    if item["description"]:
+        head += " — " + item["description"]
+    price = money(item["price"])
+    if item["original"] and item["price"] is not None and item["original"] > item["price"]:
+        price += f" (era {money(item['original'])})"
+    details = " · ".join(x for x in (price, item["condition"], item["store"]) if x)
+    line = f"• {head}\n  {details}"
+    if item["extra"]:
+        line += f"\n  Nota: {item['extra']}"
+    return line
 
-    responses = []
+
+# -------------------------------------------------------- lettura dei dati
+
+def fetch_api():
+    """Metodo veloce: chiede i dati direttamente a IKEA. Restituisce i gruppi o None."""
+    groups = []
+    for page in range(API_PAGES):
+        qs = urllib.parse.urlencode({
+            "languageCode": "it", "size": API_PAGE_SIZE,
+            "storeIds": ",".join(STORES), "column": "id",
+            "direction": "desc", "page": page,
+        })
+        req = urllib.request.Request(f"{API_URL}?{qs}", headers={
+            "User-Agent": UA,
+            "Accept": "application/json",
+            "Accept-Language": "it-IT,it;q=0.9",
+            "Origin": "https://www.ikea.com",
+            "Referer": "https://www.ikea.com/",
+        })
+        try:
+            data = json.loads(urllib.request.urlopen(req, timeout=25).read())
+        except Exception as e:
+            print(f"API diretta non raggiungibile (pagina {page}): {type(e).__name__} {e}")
+            return None if page == 0 else groups
+        groups += data.get("content") or []
+        if data.get("last"):
+            break
+    return groups
+
+
+def fetch_browser(debug=False):
+    """Piano B: apre la pagina come un browser e legge la risposta dell'API."""
+    from playwright.sync_api import sync_playwright
+
+    def launch(p):
+        return p.chromium.launch(headless=True, args=["--no-sandbox"])
+
+    groups, seen_urls = [], []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        ctx = browser.new_context(
-            locale="it-IT",
-            timezone_id="Europe/Rome",
-            viewport={"width": 1366, "height": 900},
-            user_agent=UA,
-        )
+        try:
+            browser = launch(p)
+        except Exception:
+            print("Installo Chromium...")
+            subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps",
+                            "chromium"], check=True)
+            browser = launch(p)
+        ctx = browser.new_context(locale="it-IT", timezone_id="Europe/Rome",
+                                  viewport={"width": 1366, "height": 900}, user_agent=UA)
         page = ctx.new_page()
-        page.on("response", lambda r: responses.append(r))
-        page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+        captured = []
 
-        for sel in ("#onetrust-accept-btn-handler",
-                    "button:has-text('Accetta tutti')",
-                    "button:has-text('Accetta')"):
+        def on_response(r):
+            if "offers/grouped/search" in r.url:
+                try:
+                    captured.append((r.url, r.json()))
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+        page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+        for sel in ("#onetrust-accept-btn-handler", "button:has-text('Accetta tutti')"):
             try:
                 page.click(sel, timeout=2500)
                 break
             except Exception:
                 pass
-
         try:
             page.wait_for_load_state("networkidle", timeout=30000)
         except Exception:
             pass
-        for _ in range(10):  # scorre per far caricare altri prodotti
-            page.mouse.wheel(0, 4000)
-            page.wait_for_timeout(1200)
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
+        page.wait_for_timeout(3000)
 
-        bodies, listing = [], []
-        for r in responses:
-            try:
-                ctype = r.headers.get("content-type", "")
-                listing.append(f"{r.status} {ctype[:30]:30} {r.url}")
-                if "json" not in ctype:
-                    continue
-                bodies.append((r.url, r.json()))
-            except Exception:
-                continue
-
-        items = items_from_json(bodies)
-        method = "json"
-        if not items:
-            items = items_from_dom(page)
-            method = "dom"
-        print(f"Metodo di lettura: {method}")
+        for url, data in captured:
+            seen_urls.append(url)
+            groups += data.get("content") or []
 
         if debug:
             DEBUG_DIR.mkdir(exist_ok=True)
             page.screenshot(path=str(DEBUG_DIR / "pagina.png"), full_page=True)
-            (DEBUG_DIR / "testo_pagina.txt").write_text(
-                page.inner_text("body")[:20000], encoding="utf-8")
-            (DEBUG_DIR / "risposte.txt").write_text("\n".join(listing), encoding="utf-8")
-            for i, (url, data) in enumerate(bodies[:40]):
-                raw = json.dumps(data, ensure_ascii=False)[:400000]
-                (DEBUG_DIR / f"json_{i:02d}.txt").write_text(url + "\n" + raw, encoding="utf-8")
-            sample = [{k: v for k, v in it.items() if k != "raw"} for it in items[:15]]
-            (DEBUG_DIR / "articoli_letti.json").write_text(
-                json.dumps(sample, ensure_ascii=False, indent=2), encoding="utf-8")
-
+            (DEBUG_DIR / "testo_pagina.txt").write_text(page.inner_text("body")[:20000],
+                                                        encoding="utf-8")
         browser.close()
+    print(f"Risposte API catturate dal browser: {len(seen_urls)}")
+    return groups
+
+
+def fetch_items(debug=False):
+    groups = fetch_api()
+    method = "api"
+    if not groups:
+        groups = fetch_browser(debug=debug)
+        method = "browser"
+    print(f"Metodo di lettura: {method} | gruppi: {len(groups)}")
+    items = flatten(groups)
+    if debug:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        (DEBUG_DIR / "articoli_letti.json").write_text(
+            json.dumps(items[:40], ensure_ascii=False, indent=2), encoding="utf-8")
     return items
 
 
@@ -262,19 +232,8 @@ def telegram(text):
         urllib.request.urlopen(req, timeout=20).read()
         return True
     except Exception as e:  # il token non viene mai stampato
-        print("Errore Telegram:", type(e).__name__, e)
+        print("Errore Telegram:", type(e).__name__)
         return False
-
-
-def describe(item):
-    parts = [item["name"] or item["id"]]
-    if item["price"]:
-        parts.append(item["price"])
-    if item["store"]:
-        parts.append(item["store"])
-    line = "• " + " — ".join(parts)
-    link = absolute(item["url"])
-    return line + (f"\n  {link}" if link else "")
 
 
 # --------------------------------------------------------------------- stato
@@ -305,9 +264,9 @@ def main():
 
     debug = mode == "debug"
     items = fetch_items(debug=debug)
-    print(f"Articoli letti: {len(items)}")
+    print(f"Offerte lette: {len(items)}")
     for it in items[:3]:
-        print("  esempio:", {k: v for k, v in it.items() if k != "raw"})
+        print("  esempio:", it["store"], it["title"], it["price"], it["id"])
     if debug:
         print("Modalità debug: nessun avviso inviato, stato non modificato.")
         return
@@ -315,30 +274,29 @@ def main():
     state = load_state()
 
     if not items:
-        print("::warning::Nessun articolo letto dalla pagina")
+        print("::warning::Nessuna offerta letta")
         if not state.get("fail_alerted"):
             if telegram("⚠️ Monitor IKEA: non riesco a leggere nessun articolo. "
-                        "Può essere che l'Angolo sia vuoto o che la pagina sia cambiata. "
+                        "Può essere che l'Angolo sia vuoto o che IKEA abbia cambiato qualcosa. "
                         "Ti scrivo una sola volta finché non torna a funzionare."):
                 state["fail_alerted"] = True
                 save_state(state)
         return
     state["fail_alerted"] = False
 
-    keyed = {item_key(i): i for i in items}
     seen = set(state.get("seen", []))
     alerted = set(state.get("target_alerted", []))
     first_run = not state.get("initialized")
 
-    new_items = [i for k, i in keyed.items() if k not in seen]
-    new_targets = [i for k, i in keyed.items() if is_target(i) and k not in alerted]
-    target_keys = {item_key(i) for i in new_targets}
-    new_regular = [i for i in new_items if item_key(i) not in target_keys]
+    new_items = [i for i in items if i["id"] not in seen]
+    new_targets = [i for i in items if is_target(i) and i["id"] not in alerted]
+    target_ids = {i["id"] for i in new_targets}
+    new_regular = [i for i in new_items if i["id"] not in target_ids]
 
     ok = True
     if first_run:
-        ok &= telegram(f"✅ Monitor attivo. Ho memorizzato {len(items)} articoli già presenti. "
-                       "Da ora ti avviso solo per quelli nuovi.")
+        ok &= telegram(f"✅ Monitor attivo. Ho memorizzato {len(items)} offerte già presenti. "
+                       "Da ora ti avviso solo per quelle nuove.")
     elif new_regular:
         for start in range(0, len(new_regular), MAX_ITEMS_PER_MESSAGE):
             chunk = new_regular[start:start + MAX_ITEMS_PER_MESSAGE]
@@ -357,9 +315,9 @@ def main():
         sys.exit(1)
 
     seen_list = list(state.get("seen", []))
-    seen_list += [k for k in keyed if k not in seen]
+    seen_list += [i["id"] for i in items if i["id"] not in seen]
     state.update({"initialized": True, "seen": seen_list,
-                  "target_alerted": list(alerted | target_keys)})
+                  "target_alerted": list(alerted | target_ids)})
     save_state(state)
     print(f"Nuovi: {len(new_regular)} | materasso: {len(new_targets)}")
 
