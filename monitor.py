@@ -28,21 +28,23 @@ PAGE_URL = (
     "https://www.ikea.com/it/it/second-hand/buy-from-ikea/"
     "#/milano+carugate-milano+corsico-milano+san+giuliano?sort=id-desc"
 )
+# Pagina della singola offerta: elenco dei 3 negozi + "/" + numero offerta
+OFFER_BASE_URL = (
+    "https://www.ikea.com/it/it/second-hand/buy-from-ikea/"
+    "#/milano+carugate-milano+corsico-milano+san+giuliano/"
+)
 API_URL = "https://web-api.ikea.com/circular/circular-asis/offers/grouped/search"
 API_PAGES = 3        # 3 pagine x 32 = i 96 gruppi più recenti
 API_PAGE_SIZE = 32
 
 TARGET_ARTICLE = "30450609"
 TARGET_LABEL = "VESTERÖY materasso a molle insacchettate, rigido/azzurro, 140x200 cm"
-TARGET_PRODUCT_URL = (
-    "https://www.ikea.com/it/it/p/"
-    "vesteroey-materasso-a-molle-insacchettate-rigido-azzurro-30450609/"
-)
 
 STATE_FILE = Path("state.json")
 DEBUG_DIR = Path("debug")
 MAX_SEEN = 5000
 MAX_ITEMS_PER_MESSAGE = 10
+MAX_PHOTOS = 5  # fino a 5 nuovi articoli per giro: foto singole; oltre, elenco di testo
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -98,8 +100,29 @@ def flatten(groups):
                 "original": g.get("originalPrice"),
                 "condition": o.get("productConditionTitle") or "",
                 "extra": o.get("additionalInfo") or "",
+                "image": g.get("heroImage") or "",
+                "link": (OFFER_BASE_URL + str(o["offerNumber"])
+                         if o.get("offerNumber") else PAGE_URL),
             }
     return list(items.values())
+
+
+def telegram_photo(image_url, caption):
+    """Invia una foto con didascalia. Se non riesce, ripiega sul solo testo."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not (token and chat and image_url):
+        return telegram(caption)
+    data = urllib.parse.urlencode({
+        "chat_id": chat, "photo": image_url, "caption": caption[:1000],
+    }).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendPhoto", data=data)
+    try:
+        urllib.request.urlopen(req, timeout=25).read()
+        return True
+    except Exception as e:
+        print("Foto non inviata, mando solo testo:", type(e).__name__)
+        return telegram(caption)
 
 
 def describe(item):
@@ -113,6 +136,8 @@ def describe(item):
     line = f"• {head}\n  {details}"
     if item["extra"]:
         line += f"\n  Nota: {item['extra']}"
+    if item.get("link"):
+        line += f"\n  {item['link']}"
     return line
 
 
@@ -297,7 +322,13 @@ def main():
     if first_run:
         ok &= telegram(f"✅ Monitor attivo. Ho memorizzato {len(items)} offerte già presenti. "
                        "Da ora ti avviso solo per quelle nuove.")
+    elif new_regular and len(new_regular) <= MAX_PHOTOS:
+        # pochi articoli: un messaggio con foto per ciascuno
+        for i in new_regular:
+            ok &= telegram_photo(i["image"], "🆕 Nuovo all'Angolo della circolarità\n\n"
+                                 + describe(i))
     elif new_regular:
+        # molti articoli insieme: elenco di testo
         for start in range(0, len(new_regular), MAX_ITEMS_PER_MESSAGE):
             chunk = new_regular[start:start + MAX_ITEMS_PER_MESSAGE]
             head = f"🆕 {len(new_regular)} nuovi articoli all'Angolo della circolarità"
@@ -307,8 +338,8 @@ def main():
                            + f"\n\nApri l'elenco: {PAGE_URL}")
 
     for it in new_targets:
-        ok &= telegram(f"🎯 TROVATO! {TARGET_LABEL}\n\n{describe(it)}\n\n"
-                       f"Prenotalo subito: {PAGE_URL}\nScheda prodotto: {TARGET_PRODUCT_URL}")
+        ok &= telegram_photo(it["image"], f"🎯 TROVATO! {TARGET_LABEL}\n\n{describe(it)}\n\n"
+                             f"Elenco completo: {PAGE_URL}")
 
     if not ok:
         print("Almeno un avviso non è partito: stato non aggiornato, riprovo al prossimo giro.")
