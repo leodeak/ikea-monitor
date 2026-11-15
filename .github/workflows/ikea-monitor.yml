@@ -29,9 +29,7 @@ jobs:
           cache: pip
 
       - name: Installa dipendenze
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
       - name: Esegui controllo
         env:
